@@ -4,7 +4,7 @@ TBA
 
 ## Requirements
 
-* python 3.6+
+* python 3.5+
 
 ## License
 
