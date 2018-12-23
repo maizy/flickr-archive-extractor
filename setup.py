@@ -4,7 +4,7 @@ setup(
     name='flickr-archive-extractor',
     version='0.0.1',
     install_requires=[],
-    tests_require=['nose>=1.3'],
+    tests_require=['nose>=1.3', 'pycodestyle'],
     test_suite='nose.collector',
     scripts=['flickr_archive_extractor.py'],
     author='Nikita Kovaliov',
