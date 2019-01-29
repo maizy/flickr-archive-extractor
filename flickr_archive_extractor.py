@@ -3,13 +3,15 @@
 import sys
 import os.path
 import glob
+import json
 import argparse
 import zipfile
 import collections
 import re
 import logging
+import random
 
-__version__ = '0.0.1'
+__version__ = '0.0.2'
 
 logger = logging.getLogger()
 
@@ -19,13 +21,22 @@ IGNORED_JSONS_RE = re.compile(r'(account_profile|account_testimonials|apps_comme
                               r'sent_flickrmail_part\d+|sets_comments_part\d+).json')
 
 
+def convert_archive_param(value):
+    if value is not None and os.path.isdir(value):
+        value = value.rstrip('/') + '/*.zip'
+    return value
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description='flickr archive extractor v{}'.format(__version__))
     parser.add_argument('-v', '--verbose', action='store_true')
 
     subparsers = parser.add_subparsers(help='command --help', dest='command')
     check = subparsers.add_parser('check', help='check archives')
-    check.add_argument('--archive', help='path to archives. globs may be used', action='append', required=True)
+    check.add_argument('--archive', help='path to archives. globs may be used', action='append',
+                       type=convert_archive_param, required=True)
+    check.add_argument('--samples-size', default=10, type=int,
+                       help='Size of displayed detailed samples for different kinds of data')
 
     args = parser.parse_args()
     if args.command is None:
@@ -45,75 +56,201 @@ def list_archives(archive_globs):
     return archives_paths, wrong_paths
 
 
-class FlickrArchive(collections.namedtuple('Archives', ['zip_files', 'albums', 'items_infos_index', 'items'])):
+class FlickrArchive(collections.namedtuple('Archives', ['zip_files', 'albums', 'items_metadata', 'items'])):
     def __str__(self):
-        return ('FlickrArchive<zip_files: {z}, items infos: {pi}, items: {i}, albums: {al}>'
-                .format(z=len(self.zip_files), pi=len(self.items_infos_index), i=len(self.items),
-                        al='found' if self.albums else 'not found', ))
+        return ('FlickrArchive<zip_files: {z}, items metadata: {pi}, items: {i}, albums: {al}>'
+                .format(z=len(self.zip_files), pi=len(self.items_metadata), i=len(self.items),
+                        al='found' if self.albums else 'not found'))
+
+    @classmethod
+    def build(cls, archives):
+        zip_files = ZipFiles()
+        albums = None
+        items_metadata = {}
+        items = {}
+        types = set()
+        for archive_id, archive in enumerate(archives):
+            zf = zipfile.ZipFile(archive)
+            zip_files.add_archive(archive_id, zf)
+            for file_path in zf.namelist():
+                file = ArchiveFile(archive_id=archive_id, path=file_path)
+                if file_path == 'albums.json':
+                    albums = file
+                    continue
+
+                item_match_1 = re.match(r'(?P<name>.+)_(?P<id>[0-9]+)_o\.(?P<ext>[a-z0-9]+)', file_path)
+                item_match_2 = re.match(r'(?P<id>[0-9]+)_(?P<name>[0-9a-f]+)_o\.(?P<ext>[a-z0-9]+)', file_path)
+                item_match_video = re.match(r'(?P<name>.+)_(?P<id>[0-9]+)\.(?P<ext>avi|mov|mp4|m4v)', file_path)
+
+                item_match = item_match_1 or item_match_2 or item_match_video
+                if item_match and item_match.group('ext') != 'json':
+                    item_type, item = cls._process_item_original_file(file, item_match)
+                    if item.id in items:
+                        logging.warning('Duplicate item with id %s. %s, %s', item.id, items[item.id], item)
+                    else:
+                        items[item.id] = item
+                    continue
+
+                item_metadata_match = re.match(r'photo_(?P<id>[0-9]+).json', file_path)
+                if item_metadata_match:
+                    item_metadata = cls._process_item_metadata(file, zip_files, item_metadata_match)
+                    if item_metadata.id in items_metadata:
+                        logging.warning('Duplicate item info with id %s. %s, %s',
+                                        item_metadata.id, items_metadata[item_metadata.id], item_metadata)
+                    else:
+                        items_metadata[item_metadata.id] = item_metadata
+                    continue
+
+                if not IGNORED_JSONS_RE.match(file_path):
+                    logging.warning('Unknown file in archive: %s', file)
+
+        logging.debug('Item types in archive: {}'.format(', '.join(types)))
+        return FlickrArchive(zip_files, albums, items_metadata, items)
+
+    @classmethod
+    def _process_item_original_file(cls, file, item_match):
+        item_type = item_match.group('ext')
+        item_id = int(item_match.group('id'))
+        item = Item(item_id, file=file, type=item_type, name=item_match.group('name'))
+        return item_type, item
+
+    @classmethod
+    def _process_item_metadata(cls, file, zip_files, item_match):
+        photo_id = int(item_match.group('id'))
+        metadata = zip_files.parse_json(file)
+        return ItemMetadata(
+            photo_id,
+            metadata_file=file,
+            original_name=metadata['original'],
+            albums=metadata['albums'],
+            page_url=metadata['photopage']
+        )
 
 
-ArchiveFile = collections.namedtuple('ArchiveFile', ['archive_id', 'path'])
-ArchiveItem = collections.namedtuple('ArchiveItem', ['id', 'file', 'type'])
+class ArchiveFile(collections.namedtuple('ArchiveFile', ['archive_id', 'path'])):
+
+    @property
+    def base_name(self):
+        return self.path.split('/')[-1]
+
+    def archive_name(self, zip_files):
+        return zip_files.archive_by_id(self.archive_id).filename.split('/')[-1]
 
 
-def build_archives_index(archives):
-    zip_files = {}
-    albums = None
-    items_infos = {}
-    items = {}
-    types = set()
-    for archive_id, archive in enumerate(archives):
-        zf = zipfile.ZipFile(archive)
-        zip_files[archive_id] = zf
-        for file_path in zf.namelist():
-            file = ArchiveFile(archive_id=archive_id, path=file_path)
-            if file_path == 'albums.json':
-                albums = file
-                continue
-            item_match = re.match(r'(.+)\.([a-z0-9]+)', file_path)
-            if item_match and item_match.group(2) != 'json':
-                types.add(item_match.group(2))
-                item_name = item_match.group(1)
-                item_id = item_name  # TODO: parse id
-                item = ArchiveItem(item_id, file, item_match.group(2))
-                if item.id in items:
-                    logging.warning('Duplicate item with id %s. %s, %s', item_id, items[item.id], item)
-                else:
-                    items[item.id] = item
-                continue
-            photo_info_match = re.match(r'photo_([0-9]+).json', file_path)
-            if photo_info_match:
-                photo_id = int(photo_info_match.group(1))
-                if photo_id in items_infos:
-                    logging.warning('Duplicate item info with id %s. %s, %s', photo_id, items_infos[photo_id], file)
-                else:
-                    items_infos[photo_id] = file
-                continue
-            if not IGNORED_JSONS_RE.match(file_path):
-                logging.debug('Unknown file in archive: %s', file)
-    logging.debug('Item types in archive: {}'.format(', '.join(types)))
-    return FlickrArchive(zip_files, albums, items_infos, items)
+class Item(collections.namedtuple('Item', ['id', 'file', 'name', 'type'])):
+    pass
 
 
-def check(archive_globs):
+class ItemMetadata(collections.namedtuple('ItemMetadata', ['id', 'metadata_file', 'original_name',
+                                                           'albums', 'page_url'])):
+    @property
+    def is_unprocessed_video(self):
+        return self.original_name.split('/')[-1] == 'video_encoding.jpg'
+
+
+class ZipFiles:
+    def __init__(self):
+        self._zip_files = {}
+
+    def add_archive(self, archive_id, zip_file):
+        self._zip_files[archive_id] = zip_file
+
+    def archive_by_id(self, archive_id):
+        return self._zip_files.get(archive_id)
+
+    def open_file(self, file: ArchiveFile, mode='r'):
+        if file.archive_id not in self._zip_files:
+            raise RuntimeError("archive with id '{}' not found".format(file.archive_id))
+
+        zf = self._zip_files[file.archive_id]
+        try:
+            zf.getinfo(file.path)
+        except KeyError as e:
+            raise RuntimeError("path '{}' not found in archive".format(file.path)) from e
+        return zf.open(file.path, mode)
+
+    def get_file_content(self, file):
+        return self.open_file(file).read()
+
+    def parse_json(self, file):
+        return json.loads(self.get_file_content(file).decode('utf-8'))
+
+    def __len__(self) -> int:
+        return len(self._zip_files)
+
+
+def check(archive_globs, samples_size=30):
     archives_paths, wrong_paths = list_archives(archive_globs)
 
-    print('Archives globs:\n * {}'.format('\n * '.join(archive_globs)))
-    if archives_paths:
-        print('Archives paths:\n * {}'.format('\n * '.join(archives_paths)))
+    logger.info('Archives globs:\n * {}'.format('\n * '.join(archive_globs)))
+    logger.info('Archives paths found: {}'.format(len(archives_paths)))
+    if archives_paths and logger.isEnabledFor(logging.DEBUG):
+        logger.debug('Archives paths:\n * {}'.format('\n * '.join(archives_paths)))
     if wrong_paths:
-        print('Wrong paths:\n * {}'.format('\n * '.join(wrong_paths)))
+        logger.warning('Wrong paths:\n * {}'.format('\n * '.join(wrong_paths)))
 
-    archive = build_archives_index(archives_paths)
-    print(archive)
+    logger.info('Indexing archives ...')
+    archive = FlickrArchive.build(archives_paths)
+    logger.info('Index has been built')
+
+    logger.info('Items found: {}'.format(len(archive.items)))
+    logger.info('Items metadata found: {}'.format(len(archive.items_metadata)))
+
+    items_keys = set(archive.items.keys())
+    metadata_keys = set(archive.items_metadata.keys())
+
+    unprocessed_videos_metadata = {pid: meta for pid, meta in archive.items_metadata.items()
+                                   if meta.is_unprocessed_video}
+
+    unprocessed_videos_metadata_keys = set(unprocessed_videos_metadata.keys())
+
+    without_metadata = items_keys - metadata_keys
+
+    without_metadata_sample_pids = list(without_metadata)
+    random.shuffle(without_metadata_sample_pids)
+    without_metadata_sample_pids = without_metadata_sample_pids[0:samples_size]
+    without_metadata_sample = [archive.items[pid] for pid in without_metadata_sample_pids]
+
+    without_items = [archive.items_metadata[pid] for pid in
+                     (metadata_keys - items_keys - unprocessed_videos_metadata_keys)]
+
+    if without_metadata:
+        logger.info(
+            'Found {len} items without metadata (up to {sample} random items):\n   * {list}{etc}'.format(
+                len=len(without_metadata),
+                sample=samples_size,
+                list='\n   * '.join(
+                    'id={id}, archive={an}, path={f.path}'.format(
+                        id=item.id,
+                        f=item.file,
+                        an=item.file.archive_name(archive.zip_files)
+                    )
+                    for item in without_metadata_sample
+                ),
+                etc='\n...' if len(without_metadata) > samples_size else ''
+            )
+        )
+
+    if without_items:
+        logger.info(
+            'Found {len} items without an original file, check & download files by links bellow:\n   * {list}'.format(
+                len=len(without_items),
+                list='\n   * '.join('id={}: {}'.format(i.id, i.page_url) for i in without_items)
+            )
+        )
 
 
 if __name__ == '__main__':
     args = parse_args()
-    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, stream=sys.stderr)
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        stream=sys.stderr,
+        format='%(asctime)s %(levelname).1s %(message)s',
+        datefmt='%H:%M:%S'
+    )
 
     if args.command == 'check':
-        if not check(args.archive):
+        if not check(args.archive, args.samples_size):
             sys.exit(1)
     else:
         print('Unknown command {}'.format(args.command))
