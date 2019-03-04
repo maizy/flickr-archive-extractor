@@ -69,6 +69,7 @@ class FlickrArchive(collections.namedtuple('Archives', ['zip_files', 'albums', '
         items_metadata = {}
         items = {}
         types = set()
+        items_ids = iter(range(0, 10**7))
         for archive_id, archive in enumerate(archives):
             zf = zipfile.ZipFile(archive)
             zip_files.add_archive(archive_id, zf)
@@ -84,11 +85,13 @@ class FlickrArchive(collections.namedtuple('Archives', ['zip_files', 'albums', '
 
                 item_match = item_match_1 or item_match_2 or item_match_video
                 if item_match and item_match.group('ext') != 'json':
-                    item_type, item = cls._process_item_original_file(file, item_match)
-                    if item.id in items:
-                        logging.warning('Duplicate item with id %s. %s, %s', item.id, items[item.id], item)
+                    item_type, main_res, alt_res = cls._process_item_original_file(file, item_match, next(items_ids))
+                    if main_res.id in items:
+                        logging.warning('Duplicate item with id %s. %s, %s', main_res.id, items[main_res.id], main_res)
                     else:
-                        items[item.id] = item
+                        items[main_res.id] = main_res
+                    if alt_res is not None and alt_res.id not in items:
+                        items[alt_res.id] = alt_res
                     continue
 
                 item_metadata_match = re.match(r'photo_(?P<id>[0-9]+).json', file_path)
@@ -108,11 +111,16 @@ class FlickrArchive(collections.namedtuple('Archives', ['zip_files', 'albums', '
         return FlickrArchive(zip_files, albums, items_metadata, items)
 
     @classmethod
-    def _process_item_original_file(cls, file, item_match):
+    def _process_item_original_file(cls, file, item_match, uid):
         item_type = item_match.group('ext')
         item_id = int(item_match.group('id'))
-        item = Item(item_id, file=file, type=item_type, name=item_match.group('name'))
-        return item_type, item
+        name = item_match.group('name')
+        main_item = Item(item_id, uid, file=file, name=name, type=item_type)
+        alt_item = None
+        if re.match(r'^\d+$', name) is not None:
+            # swap name & item id
+            alt_item = Item(id=int(name), uid=uid, file=file, name=str(item_id), type=item_type)
+        return item_type, main_item, alt_item
 
     @classmethod
     def _process_item_metadata(cls, file, zip_files, item_match):
@@ -137,7 +145,7 @@ class ArchiveFile(collections.namedtuple('ArchiveFile', ['archive_id', 'path']))
         return zip_files.archive_by_id(self.archive_id).filename.split('/')[-1]
 
 
-class Item(collections.namedtuple('Item', ['id', 'file', 'name', 'type'])):
+class Item(collections.namedtuple('Item', ['id', 'uid', 'file', 'name', 'type'])):
     pass
 
 
@@ -199,12 +207,20 @@ def check(archive_globs, samples_size=30):
     items_keys = set(archive.items.keys())
     metadata_keys = set(archive.items_metadata.keys())
 
+    matched_keys = items_keys.intersection(metadata_keys)
+    logger.info('Items with matched metadata: {}'.format(len(matched_keys)))
+
+    matched_uid = {archive.items[key].uid for key in matched_keys}
+
     unprocessed_videos_metadata = {pid: meta for pid, meta in archive.items_metadata.items()
                                    if meta.is_unprocessed_video}
 
     unprocessed_videos_metadata_keys = set(unprocessed_videos_metadata.keys())
+    logger.info('Unprocessed videos detected: {}'.format(len(unprocessed_videos_metadata_keys)))
 
-    without_metadata = items_keys - metadata_keys
+    without_metadata_unfiltered = items_keys - metadata_keys
+    without_metadata = {key for key in without_metadata_unfiltered
+                        if archive.items[key].uid not in matched_uid}
 
     without_metadata_sample_pids = list(without_metadata)
     random.shuffle(without_metadata_sample_pids)
