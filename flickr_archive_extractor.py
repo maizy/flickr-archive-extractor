@@ -10,6 +10,7 @@ import collections
 import re
 import logging
 import random
+import datetime
 
 __version__ = '0.0.2'
 
@@ -56,16 +57,114 @@ def list_archives(archive_globs):
     return archives_paths, wrong_paths
 
 
-class FlickrArchive(collections.namedtuple('Archives', ['zip_files', 'albums', 'items_metadata', 'items'])):
+def sample(list_like, size):
+    copy = list(list_like)
+    random.shuffle(copy)
+    return copy[0:size]
+
+
+def map_sample(map_like, size):
+    return dict(sample(map_like.items(), size))
+
+
+def log_sample(sample, orig_size, format_func, what='items'):
+    sample_size = len(sample)
+    if sample_size > 0:
+        logger.info(
+            '⚠️ Found {len} {what} ({sample_size} random items):\n   * {list}{etc}'.format(
+                len=orig_size,
+                what=what,
+                sample_size=sample_size,
+                list='\n   * '.join(format_func(key) for key in sample),
+                etc='\n   * ...' if orig_size > sample_size else ''
+            )
+        )
+    else:
+        logger.info("✅ There isn't %s", what)
+
+
+class FlickrArchive:
+
+    def __init__(self, zip_files, albums_file, items_metadata, items):
+        self.zip_files = zip_files
+        self.albums_file = albums_file
+        self.items_metadata = items_metadata
+        self.items = items
+        self.without_metadata = None
+        self.without_items = None
+        self.unprocessed_videos_metadata = None
+        self.matched = None
+        self.albums = None
+        self.wrong_items_in_albums = None
+        self.missed_items_in_albums = None
+        self._post_process()
+
     def __str__(self):
         return ('FlickrArchive<zip_files: {z}, items metadata: {pi}, items: {i}, albums: {al}>'
                 .format(z=len(self.zip_files), pi=len(self.items_metadata), i=len(self.items),
-                        al='found' if self.albums else 'not found'))
+                        al='found' if self.albums_file else 'not found'))
+
+    def _post_process(self):
+        items_keys = set(self.items.keys())
+        metadata_keys = set(self.items_metadata.keys())
+
+        matched_keys = items_keys.intersection(metadata_keys)
+
+        matched_uid = {self.items[key].uid for key in matched_keys}
+
+        self.unprocessed_videos_metadata = {key: meta for key, meta in self.items_metadata.items()
+                                            if meta.is_unprocessed_video}
+        unprocessed_videos_metadata_keys = set(self.unprocessed_videos_metadata.keys())
+
+        without_metadata_unfiltered = items_keys - metadata_keys
+        self.without_metadata = {key: self.items[key] for key in without_metadata_unfiltered
+                                 if self.items[key].uid not in matched_uid}
+
+        self.without_items = {key: self.items_metadata[key] for key in
+                              (metadata_keys - items_keys - unprocessed_videos_metadata_keys)}
+
+        self.matched = {key: ItemWithMetadata(self.items[key], self.items_metadata[key])
+                        for key in matched_keys}
+
+        if self.albums_file:
+            self.albums = {}
+            self.missed_items_in_albums = []
+            self.wrong_items_in_albums = []
+            albums_json = self.zip_files.parse_json(self.albums_file)
+            for album_json in (albums_json.get('albums') or []):
+                items = []
+                album_id = album_json['id']
+                for pid in (album_json.get('photos') or []):
+                    if pid == '0':  # wrong photos ids
+                        continue
+                    if not re.match(r'^\d+$', pid):
+                        self.wrong_items_in_albums.append((album_id, pid))
+                    else:
+                        pid_int = int(pid)
+                        if pid_int in self.unprocessed_videos_metadata:
+                            continue
+                        elif pid_int not in self.matched:
+                            self.missed_items_in_albums.append((album_id, pid_int))
+                        else:
+                            items.append(int(pid))
+                album = Album(
+                    id=album_id,
+                    title=album_json.get('title') or '',
+                    description=albums_json.get('description') or '',
+                    url=album_json['url'],
+                    created=datetime.datetime.fromtimestamp(int(album_json['created'])),
+                    updated=datetime.datetime.fromtimestamp(int(album_json['last_updated'])),
+                    items_ids=items
+                )
+                if album_id in self.albums:
+                    logger.warning('Duplicate album with id %s. %s, %s', album_id, self.albums[album_id], album)
+                else:
+                    self.albums[album_id] = album
 
     @classmethod
     def build(cls, archives):
         zip_files = ZipFiles()
-        albums = None
+        albums_file = None
         items_metadata = {}
         items = {}
         types = set()
@@ -76,7 +175,7 @@ class FlickrArchive(collections.namedtuple('Archives', ['zip_files', 'albums', '
             for file_path in zf.namelist():
                 file = ArchiveFile(archive_id=archive_id, path=file_path)
                 if file_path == 'albums.json':
-                    albums = file
+                    albums_file = file
                     continue
 
                 item_match_1 = re.match(r'(?P<name>.+)_(?P<id>[0-9]+)_o\.(?P<ext>[a-z0-9]+)', file_path)
@@ -87,7 +186,7 @@ class FlickrArchive(collections.namedtuple('Archives', ['zip_files', 'albums', '
                 if item_match and item_match.group('ext') != 'json':
                     item_type, main_res, alt_res = cls._process_item_original_file(file, item_match, next(items_ids))
                     if main_res.id in items:
-                        logging.warning('Duplicate item with id %s. %s, %s', main_res.id, items[main_res.id], main_res)
+                        logger.warning('Duplicate item with id %s. %s, %s', main_res.id, items[main_res.id], main_res)
                     else:
                         items[main_res.id] = main_res
                     if alt_res is not None and alt_res.id not in items:
@@ -108,7 +207,7 @@ class FlickrArchive(collections.namedtuple('Archives', ['zip_files', 'albums', '
                     logging.warning('Unknown file in archive: %s', file)
 
         logging.debug('Item types in archive: {}'.format(', '.join(types)))
-        return FlickrArchive(zip_files, albums, items_metadata, items)
+        return FlickrArchive(zip_files, albums_file, items_metadata, items)
 
     @classmethod
     def _process_item_original_file(cls, file, item_match, uid):
@@ -145,8 +244,9 @@ class ArchiveFile(collections.namedtuple('ArchiveFile', ['archive_id', 'path']))
         return zip_files.archive_by_id(self.archive_id).filename.split('/')[-1]
 
 
-class Item(collections.namedtuple('Item', ['id', 'uid', 'file', 'name', 'type'])):
-    pass
+Item = collections.namedtuple('Item', ['id', 'uid', 'file', 'name', 'type'])
+ItemWithMetadata = collections.namedtuple('ItemWithMetadata', ['item', 'metadata'])
+Album = collections.namedtuple('Album', ['id', 'title', 'description', 'url', 'created', 'updated', 'items_ids'])
 
 
 class ItemMetadata(collections.namedtuple('ItemMetadata', ['id', 'metadata_file', 'original_name',
@@ -204,55 +304,43 @@ def check(archive_globs, samples_size=30):
     logger.info('Items found: {}'.format(len(archive.items)))
     logger.info('Items metadata found: {}'.format(len(archive.items_metadata)))
 
-    items_keys = set(archive.items.keys())
-    metadata_keys = set(archive.items_metadata.keys())
+    logger.info('Items with matched metadata: {}'.format(len(archive.matched)))
+    logger.info('Unprocessed videos detected: {}'.format(len(archive.unprocessed_videos_metadata)))
 
-    matched_keys = items_keys.intersection(metadata_keys)
-    logger.info('Items with matched metadata: {}'.format(len(matched_keys)))
+    log_sample(
+        map_sample(archive.without_metadata, samples_size).items(),
+        len(archive.without_metadata),
+        lambda pair: ('id={id}, archive={an}, path={f.path}'
+                      .format(id=pair[1].id, f=pair[1].file, an=pair[1].file.archive_name(archive.zip_files))),
+        'items without metadata'
+    )
 
-    matched_uid = {archive.items[key].uid for key in matched_keys}
-
-    unprocessed_videos_metadata = {pid: meta for pid, meta in archive.items_metadata.items()
-                                   if meta.is_unprocessed_video}
-
-    unprocessed_videos_metadata_keys = set(unprocessed_videos_metadata.keys())
-    logger.info('Unprocessed videos detected: {}'.format(len(unprocessed_videos_metadata_keys)))
-
-    without_metadata_unfiltered = items_keys - metadata_keys
-    without_metadata = {key for key in without_metadata_unfiltered
-                        if archive.items[key].uid not in matched_uid}
-
-    without_metadata_sample_pids = list(without_metadata)
-    random.shuffle(without_metadata_sample_pids)
-    without_metadata_sample_pids = without_metadata_sample_pids[0:samples_size]
-    without_metadata_sample = [archive.items[pid] for pid in without_metadata_sample_pids]
-
-    without_items = [archive.items_metadata[pid] for pid in
-                     (metadata_keys - items_keys - unprocessed_videos_metadata_keys)]
-
-    if without_metadata:
+    if archive.without_items:
         logger.info(
-            'Found {len} items without metadata (up to {sample} random items):\n   * {list}{etc}'.format(
-                len=len(without_metadata),
-                sample=samples_size,
-                list='\n   * '.join(
-                    'id={id}, archive={an}, path={f.path}'.format(
-                        id=item.id,
-                        f=item.file,
-                        an=item.file.archive_name(archive.zip_files)
-                    )
-                    for item in without_metadata_sample
-                ),
-                etc='\n...' if len(without_metadata) > samples_size else ''
-            )
+            ('⚠️  Found {len} items without an original file, check & download files by links bellow:\n   * {list}'
+             .format(len=len(archive.without_items),
+                     list='\n   * '.join('id={}: {}'.format(i.id, i.page_url)
+                                         for i in archive.without_items.values())))
         )
+    else:
+        logger.info("✅ There isn't items without an original file")
 
-    if without_items:
-        logger.info(
-            'Found {len} items without an original file, check & download files by links bellow:\n   * {list}'.format(
-                len=len(without_items),
-                list='\n   * '.join('id={}: {}'.format(i.id, i.page_url) for i in without_items)
-            )
+    if not archive.albums:
+        logger.error('⚠️  Albums not found')
+    else:
+        logger.info('Albums found: {}'.format(len(archive.albums)))
+        log_sample(
+            sample(archive.wrong_items_in_albums, samples_size),
+            len(archive.wrong_items_in_albums),
+            lambda pair: 'album_id={a}, item id={i}'.format(a=pair[0], i=pair[1]),
+            'wrong items in albums'
+        )
+        log_sample(
+            sample(archive.missed_items_in_albums, samples_size),
+            len(archive.missed_items_in_albums),
+            lambda pair: ('album_id={a}, item id={i}, album url={url}'
+                          .format(a=pair[0], i=pair[1], url=archive.albums[pair[0]].url)),
+            'missed items in albums'
         )
 
 
