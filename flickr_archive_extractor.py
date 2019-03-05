@@ -56,11 +56,45 @@ def list_archives(archive_globs):
     return archives_paths, wrong_paths
 
 
-class FlickrArchive(collections.namedtuple('Archives', ['zip_files', 'albums', 'items_metadata', 'items'])):
+class FlickrArchive:
+
+    def __init__(self, zip_files, albums, items_metadata, items):
+        self.zip_files = zip_files
+        self.albums = albums
+        self.items_metadata = items_metadata
+        self.items = items
+        self.without_metadata = None
+        self.without_items = None
+        self.unprocessed_videos_metadata = None
+        self.matched = None
+        self._post_process()
+
     def __str__(self):
         return ('FlickrArchive<zip_files: {z}, items metadata: {pi}, items: {i}, albums: {al}>'
                 .format(z=len(self.zip_files), pi=len(self.items_metadata), i=len(self.items),
                         al='found' if self.albums else 'not found'))
+
+    def _post_process(self):
+        items_keys = set(self.items.keys())
+        metadata_keys = set(self.items_metadata.keys())
+
+        matched_keys = items_keys.intersection(metadata_keys)
+
+        matched_uid = {self.items[key].uid for key in matched_keys}
+
+        self.unprocessed_videos_metadata = {key: meta for key, meta in self.items_metadata.items()
+                                            if meta.is_unprocessed_video}
+        unprocessed_videos_metadata_keys = set(self.unprocessed_videos_metadata.keys())
+
+        without_metadata_unfiltered = items_keys - metadata_keys
+        self.without_metadata = {key: self.items[key] for key in without_metadata_unfiltered
+                                 if self.items[key].uid not in matched_uid}
+
+        self.without_items = {key: self.items_metadata[key] for key in
+                              (metadata_keys - items_keys - unprocessed_videos_metadata_keys)}
+
+        self.matched = {key: ItemWithMetadata(self.items[key], self.items_metadata[key])
+                        for key in matched_keys}
 
     @classmethod
     def build(cls, archives):
@@ -145,8 +179,9 @@ class ArchiveFile(collections.namedtuple('ArchiveFile', ['archive_id', 'path']))
         return zip_files.archive_by_id(self.archive_id).filename.split('/')[-1]
 
 
-class Item(collections.namedtuple('Item', ['id', 'uid', 'file', 'name', 'type'])):
-    pass
+Item = collections.namedtuple('Item', ['id', 'uid', 'file', 'name', 'type'])
+
+ItemWithMetadata = collections.namedtuple('ItemWithMetadata', ['item', 'metadata'])
 
 
 class ItemMetadata(collections.namedtuple('ItemMetadata', ['id', 'metadata_file', 'original_name',
@@ -204,36 +239,18 @@ def check(archive_globs, samples_size=30):
     logger.info('Items found: {}'.format(len(archive.items)))
     logger.info('Items metadata found: {}'.format(len(archive.items_metadata)))
 
-    items_keys = set(archive.items.keys())
-    metadata_keys = set(archive.items_metadata.keys())
+    logger.info('Items with matched metadata: {}'.format(len(archive.matched)))
+    logger.info('Unprocessed videos detected: {}'.format(len(archive.unprocessed_videos_metadata)))
 
-    matched_keys = items_keys.intersection(metadata_keys)
-    logger.info('Items with matched metadata: {}'.format(len(matched_keys)))
-
-    matched_uid = {archive.items[key].uid for key in matched_keys}
-
-    unprocessed_videos_metadata = {pid: meta for pid, meta in archive.items_metadata.items()
-                                   if meta.is_unprocessed_video}
-
-    unprocessed_videos_metadata_keys = set(unprocessed_videos_metadata.keys())
-    logger.info('Unprocessed videos detected: {}'.format(len(unprocessed_videos_metadata_keys)))
-
-    without_metadata_unfiltered = items_keys - metadata_keys
-    without_metadata = {key for key in without_metadata_unfiltered
-                        if archive.items[key].uid not in matched_uid}
-
-    without_metadata_sample_pids = list(without_metadata)
+    without_metadata_sample_pids = list(archive.without_metadata.keys())
     random.shuffle(without_metadata_sample_pids)
     without_metadata_sample_pids = without_metadata_sample_pids[0:samples_size]
     without_metadata_sample = [archive.items[pid] for pid in without_metadata_sample_pids]
 
-    without_items = [archive.items_metadata[pid] for pid in
-                     (metadata_keys - items_keys - unprocessed_videos_metadata_keys)]
-
-    if without_metadata:
+    if archive.without_metadata:
         logger.info(
             'Found {len} items without metadata (up to {sample} random items):\n   * {list}{etc}'.format(
-                len=len(without_metadata),
+                len=len(archive.without_metadata),
                 sample=samples_size,
                 list='\n   * '.join(
                     'id={id}, archive={an}, path={f.path}'.format(
@@ -243,15 +260,15 @@ def check(archive_globs, samples_size=30):
                     )
                     for item in without_metadata_sample
                 ),
-                etc='\n...' if len(without_metadata) > samples_size else ''
+                etc='\n...' if len(archive.without_metadata) > samples_size else ''
             )
         )
 
-    if without_items:
+    if archive.without_items:
         logger.info(
             'Found {len} items without an original file, check & download files by links bellow:\n   * {list}'.format(
-                len=len(without_items),
-                list='\n   * '.join('id={}: {}'.format(i.id, i.page_url) for i in without_items)
+                len=len(archive.without_items),
+                list='\n   * '.join('id={}: {}'.format(i.id, i.page_url) for i in archive.without_items.values())
             )
         )
 
