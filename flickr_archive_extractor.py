@@ -11,6 +11,7 @@ import re
 import logging
 import random
 import datetime
+import pickle
 
 __version__ = '0.0.3'
 
@@ -22,10 +23,18 @@ IGNORED_JSONS_RE = re.compile(r'(account_profile|account_testimonials|apps_comme
                               r'sent_flickrmail_part\d+|sets_comments_part\d+).json')
 
 
+# args
+
 def convert_archive_param(value):
     if value is not None and os.path.isdir(value):
         value = value.rstrip('/') + '/*.zip'
     return value
+
+
+def check_path(path):
+    if not os.path.exists(path):
+        raise ValueError('{} not found'.format(path))
+    return path
 
 
 def parse_args():
@@ -33,17 +42,28 @@ def parse_args():
     parser.add_argument('-v', '--verbose', action='store_true')
 
     subparsers = parser.add_subparsers(help='command --help', dest='command')
+
     check = subparsers.add_parser('check', help='check archives')
     check.add_argument('--archive', help='path to archives. globs may be used', action='append',
                        type=convert_archive_param, required=True)
     check.add_argument('--samples-size', default=10, type=int,
                        help='Size of displayed detailed samples for different kinds of data')
 
+    upload = subparsers.add_parser('upload-to-google-photo', help='upload photos to google photos')
+    upload.add_argument('--archive', help='path to archives. globs may be used', action='append',
+                        type=convert_archive_param, required=True)
+    upload.add_argument('--app-credentials', type=check_path, metavar='client_id.json',
+                        help='path to app credentials in json format')
+    upload.add_argument('--db', type=str, default=os.path.expanduser('~/.config/flickr_archive_extractor/db'),
+                        help='path to file with database. will be created if missing.')
+
     args = parser.parse_args()
     if args.command is None:
         parser.error('command is required')
     return args
 
+
+# parse archives
 
 def list_archives(archive_globs):
     archives_paths = []
@@ -287,6 +307,42 @@ class ZipFiles:
         return len(self._zip_files)
 
 
+# google api
+
+GOOGLE_PHOTOS_SCOPES = [
+    'https://www.googleapis.com/auth/photoslibrary'
+]
+
+
+# TODO: save token in DB
+def init_google_api(credentials_path, token_path):
+    try:
+        from googleapiclient import discovery
+        from google_auth_oauthlib import flow
+        from google.auth.transport import requests
+    except ImportError:
+        logger.critical('extra requirements needed for working with google photo.\n'
+                        '  python3 -m pip install -r requirements-google-photo.txt')
+        return None
+
+    creds = None
+    if os.path.exists(token_path):
+        with open(token_path, 'rb') as token:
+            creds = pickle.load(token)
+
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(requests.Request())
+        else:
+            flow = flow.InstalledAppFlow.from_client_secrets_file(credentials_path, GOOGLE_PHOTOS_SCOPES)
+            creds = flow.run_local_server()
+        with open(token_path, 'wb') as token:
+            pickle.dump(creds, token)
+    return discovery.build('photoslibrary', 'v1', credentials=creds)
+
+# actions
+
+
 def check(archive_globs, samples_size=30):
     archives_paths, wrong_paths = list_archives(archive_globs)
 
@@ -352,10 +408,17 @@ if __name__ == '__main__':
         format='%(asctime)s %(levelname).1s %(message)s',
         datefmt='%H:%M:%S'
     )
+    logging.getLogger('googleapiclient.discovery_cache').setLevel(logging.ERROR)
 
     if args.command == 'check':
-        if not check(args.archive, args.samples_size):
+        check(args.archive, args.samples_size)
+    elif args.command == 'upload-to-google-photo':
+        print(args)
+        gclient = init_google_api(args.app_credentials, '/tmp/f2gp.token')
+        if gclient is None:
             sys.exit(1)
+        print(gclient.albums().list().execute())
+        print(gclient.mediaItems().list().execute())
     else:
         print('Unknown command {}'.format(args.command))
         sys.exit(2)
