@@ -307,6 +307,42 @@ class ZipFiles:
         return len(self._zip_files)
 
 
+# db
+
+def init_db(db_path):
+    try:
+        import sqlite3
+    except ImportError:
+        logger.critical("sqlite3 is required. it should be in the python stdlib")
+        return None
+    db = sqlite3.connect(db_path, isolation_level=None)
+    tables = (db
+              .execute(r"select name from sqlite_master where type in ('table','view') and name not like 'sqlite_%'")
+              .fetchall())
+    if not tables:
+        init_tables(db)
+    return db
+
+
+def init_tables(db):
+    db.execute("create table token (token blob)")
+    db.execute(
+        "create table albums ("
+        "  album_id text primary key not null, "
+        "  status text not null default 'none',"
+        "  google_id text"
+        ")"
+    )
+    db.execute(
+        "create table items ("
+        "  seq_id integer primary key autoincrement,"
+        "  item_id text,"
+        "  album_id text"
+        ")"
+    )
+    return db
+
+
 # google api
 
 GOOGLE_PHOTOS_SCOPES = [
@@ -315,7 +351,7 @@ GOOGLE_PHOTOS_SCOPES = [
 
 
 # TODO: save token in DB
-def init_google_api(credentials_path, token_path):
+def init_google_api(credentials_path, db):
     try:
         from googleapiclient import discovery
         from google_auth_oauthlib import flow
@@ -326,9 +362,10 @@ def init_google_api(credentials_path, token_path):
         return None
 
     creds = None
-    if os.path.exists(token_path):
-        with open(token_path, 'rb') as token:
-            creds = pickle.load(token)
+    token_res = db.execute('select token from token').fetchone()
+
+    if token_res:
+        creds = pickle.loads(token_res[0])
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
@@ -336,14 +373,15 @@ def init_google_api(credentials_path, token_path):
         else:
             flow = flow.InstalledAppFlow.from_client_secrets_file(credentials_path, GOOGLE_PHOTOS_SCOPES)
             creds = flow.run_local_server()
-        with open(token_path, 'wb') as token:
-            pickle.dump(creds, token)
+        db.execute('delete from token')
+        db.execute('insert into token (token) values(?)', (pickle.dumps(creds), ))
+
     return discovery.build('photoslibrary', 'v1', credentials=creds)
 
 # actions
 
 
-def check(archive_globs, samples_size=30):
+def _load_archives_and_log_info(archive_globs):
     archives_paths, wrong_paths = list_archives(archive_globs)
 
     logger.info('Archives globs:\n * {}'.format('\n * '.join(archive_globs)))
@@ -362,6 +400,11 @@ def check(archive_globs, samples_size=30):
 
     logger.info('Items with matched metadata: {}'.format(len(archive.matched)))
     logger.info('Unprocessed videos detected: {}'.format(len(archive.unprocessed_videos_metadata)))
+    return archive
+
+
+def check(archive_globs, samples_size=30):
+    archive = _load_archives_and_log_info(archive_globs)
 
     log_sample(
         map_sample(archive.without_metadata, samples_size).items(),
@@ -400,6 +443,30 @@ def check(archive_globs, samples_size=30):
         )
 
 
+def upload_to_google_photos(archive_globs, db_path):
+    archive = _load_archives_and_log_info(archive_globs)
+
+    db_dir = os.path.dirname(db_path)
+    if not os.path.exists(db_dir):
+        os.makedirs(db_dir, mode=0o755, exist_ok=True)
+    db = init_db(db_path)
+    if db is None:
+        return 1
+
+    gclient = init_google_api(args.app_credentials, db)
+    if gclient is None:
+        return 1
+
+    for id, album in archive.albums.items():
+        pass
+
+    print(gclient.albums().list().execute())
+    print(gclient.mediaItems().list().execute())
+
+    db.close()
+    return 0
+
+
 if __name__ == '__main__':
     args = parse_args()
     logging.basicConfig(
@@ -413,12 +480,8 @@ if __name__ == '__main__':
     if args.command == 'check':
         check(args.archive, args.samples_size)
     elif args.command == 'upload-to-google-photo':
-        print(args)
-        gclient = init_google_api(args.app_credentials, '/tmp/f2gp.token')
-        if gclient is None:
-            sys.exit(1)
-        print(gclient.albums().list().execute())
-        print(gclient.mediaItems().list().execute())
+        upload_to_google_photos(args.archive, args.db)
+
     else:
         print('Unknown command {}'.format(args.command))
         sys.exit(2)
