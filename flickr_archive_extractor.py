@@ -15,7 +15,7 @@ import pickle
 
 __version__ = '0.0.3'
 
-logger = logging.getLogger()
+logger = logging.getLogger('flickr_archive_extractor')
 
 IGNORED_JSONS_RE = re.compile(r'(account_profile|account_testimonials|apps_comments_part\d+|contacts_part\d+|'
                               r'faves_part\d+|followers_part\d+|galleries|galleries_comments_part\d+|'
@@ -100,7 +100,7 @@ def log_sample(sample, orig_size, format_func, what='items'):
             )
         )
     else:
-        logger.info("✅ There isn't %s", what)
+        logger.info("✅ There aren't %s", what)
 
 
 class FlickrArchive:
@@ -114,9 +114,11 @@ class FlickrArchive:
         self.without_items = None
         self.unprocessed_videos_metadata = None
         self.matched = None
-        self.albums = None
-        self.wrong_items_in_albums = None
-        self.missed_items_in_albums = None
+        self.albums = {}
+        self.missed_items_in_albums = []
+        self.wrong_items_in_albums = []
+        self.item_to_albums_index = {}
+        self.items_without_albums = []
         self._post_process()
 
     def __str__(self):
@@ -147,9 +149,6 @@ class FlickrArchive:
                         for key in matched_keys}
 
         if self.albums_file:
-            self.albums = {}
-            self.missed_items_in_albums = []
-            self.wrong_items_in_albums = []
             albums_json = self.zip_files.parse_json(self.albums_file)
             for album_json in (albums_json.get('albums') or []):
                 items = []
@@ -166,7 +165,10 @@ class FlickrArchive:
                         elif pid_int not in self.matched:
                             self.missed_items_in_albums.append((album_id, pid_int))
                         else:
-                            items.append(int(pid))
+                            if pid_int not in self.item_to_albums_index:
+                                self.item_to_albums_index[pid_int] = []
+                            self.item_to_albums_index[pid_int].append(album_id)
+                            items.append(pid_int)
                 album = Album(
                     id=album_id,
                     title=album_json.get('title') or '',
@@ -180,6 +182,8 @@ class FlickrArchive:
                     logger.warning('Duplicate album with id %s. %s, %s', album_id, self.albums[album_id], album)
                 else:
                     self.albums[album_id] = album
+
+        self.items_without_albums = [key for key in self.matched.keys() if key not in self.item_to_albums_index]
 
     @classmethod
     def build(cls, archives):
@@ -315,7 +319,7 @@ def init_db(db_path):
     except ImportError:
         logger.critical("sqlite3 is required. it should be in the python stdlib")
         return None
-    db = sqlite3.connect(db_path, isolation_level=None)
+    db = sqlite3.connect(db_path)
     tables = (db
               .execute(r"select name from sqlite_master where type in ('table','view') and name not like 'sqlite_%'")
               .fetchall())
@@ -325,21 +329,23 @@ def init_db(db_path):
 
 
 def init_tables(db):
-    db.execute("create table token (token blob)")
+    db.execute("create table gphotos_token (token blob)")
     db.execute(
-        "create table albums ("
-        "  album_id text primary key not null, "
+        "create table gphotos_albums ("
+        "  seq_id integer primary key autoincrement,"
+        "  album_id text not null,"
         "  status text not null default 'none',"
         "  google_id text"
         ")"
     )
     db.execute(
-        "create table items ("
-        "  seq_id integer primary key autoincrement,"
-        "  item_id text,"
-        "  album_id text"
+        "create table gphotos_items ("
+        "  item_id integer primary key,"
+        "  status text not null default 'none',"
+        "  google_id text"
         ")"
     )
+    db.commit()
     return db
 
 
@@ -350,8 +356,7 @@ GOOGLE_PHOTOS_SCOPES = [
 ]
 
 
-# TODO: save token in DB
-def init_google_api(credentials_path, db):
+def init_google_photos_api(credentials_path, db):
     try:
         from googleapiclient import discovery
         from google_auth_oauthlib import flow
@@ -362,7 +367,7 @@ def init_google_api(credentials_path, db):
         return None
 
     creds = None
-    token_res = db.execute('select token from token').fetchone()
+    token_res = db.execute('select token from gphotos_token').fetchone()
 
     if token_res:
         creds = pickle.loads(token_res[0])
@@ -373,15 +378,68 @@ def init_google_api(credentials_path, db):
         else:
             flow = flow.InstalledAppFlow.from_client_secrets_file(credentials_path, GOOGLE_PHOTOS_SCOPES)
             creds = flow.run_local_server()
-        db.execute('delete from token')
-        db.execute('insert into token (token) values(?)', (pickle.dumps(creds), ))
+        db.execute('delete from gphotos_token')
+        db.execute('insert into gphotos_token (token) values(?)', (pickle.dumps(creds), ))
 
     return discovery.build('photoslibrary', 'v1', credentials=creds)
+
+
+def init_albums_to_upload_to_google_photos(albums_sorted, db):
+    existed = 0
+    created = 0
+    albums_sorted = sorted(albums_sorted.items(), key=lambda x: x[1].created)
+    for album_id, album in albums_sorted:
+        seq_id_res = db.execute('select seq_id from gphotos_albums where album_id = ?', (album_id, )).fetchone()
+        if not seq_id_res:
+            db.execute('insert into gphotos_albums (album_id) values (?)', (album_id, ))
+            created += 1
+        else:
+            existed += 1
+    db.commit()
+    return existed, created
+
+
+def init_items_to_upload_to_google_photos(items_with_metadata, item_to_albums_index, db):
+    existed = 0
+    created = 0
+
+    for index, i in enumerate(items_with_metadata.values()):
+        if index != 0 and index % 1000 == 0:
+            db.commit()
+        in_db = db.execute('select 1 from gphotos_items where item_id = ?', (i.item.id, )).fetchone()
+        if not in_db:
+            db.execute('insert into gphotos_items (item_id) values (?)', (i.item.id, ))
+            created += 1
+        else:
+            existed += 1
+    db.commit()
+    return existed, created
+
+
+def create_google_photos_album(album, album_status, album_google_id, db):
+    if album_status == 'none':
+        logging.info('Creating album "%s" (%s) (#%s)',
+                     album.title, album.created.strftime('%Y-%m-%d'), album.id)
+    # TODO
+    return album_google_id
+
+
+def upload_item_to_google_photos(item_with_meta, db):
+    item = item_with_meta.item
+    meta = item_with_meta.metadata
+    item_row = db.execute('select status, google_id from gphotos_items where item_id = ?', (item.id,)).fetchone()
+    item_status = item_row[0]
+    item_google_id = item_row[1]
+    if item_status == 'none':
+        logging.debug('Upload item #%s', item.id)
+        # TODO
+    return item_google_id
+
 
 # actions
 
 
-def _load_archives_and_log_info(archive_globs):
+def load_archives_and_log_info(archive_globs):
     archives_paths, wrong_paths = list_archives(archive_globs)
 
     logger.info('Archives globs:\n * {}'.format('\n * '.join(archive_globs)))
@@ -395,16 +453,22 @@ def _load_archives_and_log_info(archive_globs):
     archive = FlickrArchive.build(archives_paths)
     logger.info('Index has been built')
 
-    logger.info('Items found: {}'.format(len(archive.items)))
-    logger.info('Items metadata found: {}'.format(len(archive.items_metadata)))
+    logger.info('Valid items found (items with matched metadata): {}'.format(len(archive.matched)))
 
-    logger.info('Items with matched metadata: {}'.format(len(archive.matched)))
-    logger.info('Unprocessed videos detected: {}'.format(len(archive.unprocessed_videos_metadata)))
+    logger.info('Albums: {}'.format(len(archive.albums)))
+    logger.info('Items with at least one album: {}'.format(len(archive.item_to_albums_index)))
+    logger.info('Items without album: {}'.format(len(archive.items_without_albums)))
+
     return archive
 
 
 def check(archive_globs, samples_size=30):
-    archive = _load_archives_and_log_info(archive_globs)
+    archive = load_archives_and_log_info(archive_globs)
+
+    logger.info('Items found: {}'.format(len(archive.items)))
+    logger.info('Items metadata found: {}'.format(len(archive.items_metadata)))
+    if archive.unprocessed_videos_metadata:
+        logger.warning('⚠️  Unprocessed videos detected: {}'.format(len(archive.unprocessed_videos_metadata)))
 
     log_sample(
         map_sample(archive.without_metadata, samples_size).items(),
@@ -415,14 +479,14 @@ def check(archive_globs, samples_size=30):
     )
 
     if archive.without_items:
-        logger.info(
+        logger.warning(
             ('⚠️  Found {len} items without an original file, check & download files by links bellow:\n   * {list}'
              .format(len=len(archive.without_items),
                      list='\n   * '.join('id={}: {}'.format(i.id, i.page_url)
                                          for i in archive.without_items.values())))
         )
     else:
-        logger.info("✅ There isn't items without an original file")
+        logger.info("✅ There aren't items without an original file")
 
     if not archive.albums:
         logger.error('⚠️  Albums not found')
@@ -444,7 +508,7 @@ def check(archive_globs, samples_size=30):
 
 
 def upload_to_google_photos(archive_globs, db_path):
-    archive = _load_archives_and_log_info(archive_globs)
+    archive = load_archives_and_log_info(archive_globs)
 
     db_dir = os.path.dirname(db_path)
     if not os.path.exists(db_dir):
@@ -453,29 +517,78 @@ def upload_to_google_photos(archive_globs, db_path):
     if db is None:
         return 1
 
-    gclient = init_google_api(args.app_credentials, db)
+    gclient = init_google_photos_api(args.app_credentials, db)
     if gclient is None:
         return 1
 
-    for id, album in archive.albums.items():
-        pass
+    logger.info('Preparing to upload albums ...')
+    albums_existed, albums_created = init_albums_to_upload_to_google_photos(archive.albums, db)
 
-    print(gclient.albums().list().execute())
-    print(gclient.mediaItems().list().execute())
+    if albums_existed > 0:
+        logger.info('Albums to upload found in DB: %d', albums_existed)
+    if albums_created > 0:
+        logger.info('Albums to upload added: %d', albums_created)
 
+    logger.info('Preparing to upload items ...')
+    items_existed, items_created = init_items_to_upload_to_google_photos(
+        archive.matched, archive.item_to_albums_index, db
+    )
+
+    if items_existed > 0:
+        logger.info('Items to upload found in DB: %d', items_existed)
+    if items_created > 0:
+        logger.info('Items to upload added: %d', items_created)
+
+    albums = db.execute('select album_id, status, google_id from gphotos_albums order by seq_id').fetchall()
+    for album_row in albums:
+        album_id = album_row[0]
+        album = archive.albums[album_id]
+        album_google_id = create_google_photos_album(album, album_status=album_row[1], album_google_id=album_row[2],
+                                                     db=db)
+
+        total_items = len(album.items_ids)
+        logging.info('Uploading %d items for album "%s" (%s)',
+                     total_items, album.title, album.created.strftime('%Y-%m-%d'))
+
+        for index, item_id in enumerate(album.items_ids):
+            item = archive.matched[item_id]
+            item_google_id = upload_item_to_google_photos(item, db)
+            if index != 0 and index % 10 == 0:
+                logging.info('.. %d / %d', index, total_items)
+        logging.info('.. %d / %d - Done', total_items, total_items)
+
+    total_items = len(archive.items_without_albums)
+    logging.info('Uploading %d items without albums', total_items)
+
+    for index, item_id in enumerate(archive.items_without_albums):
+        item = archive.matched[item_id]
+        item_google_id = upload_item_to_google_photos(item, db)
+        if index != 0 and index % 10 == 0:
+            logging.info('.. %d / %d', index, total_items)
+    logging.info('.. %d / %d - Done', total_items, total_items)
+    db.commit()
+
+    logging.info('🎉 Job is done')
     db.close()
     return 0
 
 
 if __name__ == '__main__':
     args = parse_args()
+    if args.verbose:
+        logging_format = '%(asctime)s [%(name)s] %(levelname).1s %(message)s'
+    else:
+        logging_format = '%(asctime)s %(levelname).1s %(message)s'
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         stream=sys.stderr,
-        format='%(asctime)s %(levelname).1s %(message)s',
+        format=logging_format,
         datefmt='%H:%M:%S'
     )
     logging.getLogger('googleapiclient.discovery_cache').setLevel(logging.ERROR)
+
+    if not args.verbose:
+        logging.getLogger('googleapiclient.discovery').setLevel(logging.WARNING)
 
     if args.command == 'check':
         check(args.archive, args.samples_size)
