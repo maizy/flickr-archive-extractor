@@ -14,6 +14,7 @@ import datetime
 import pickle
 import urllib.request
 import http
+import time
 
 __version__ = '0.0.3'
 
@@ -441,24 +442,41 @@ def init_items_to_upload_to_google_photos(items_with_metadata, item_to_albums_in
     return existed, created
 
 
+class RetryException(Exception):
+    pass
+
+
 def create_google_photos_album(album, album_status, album_google_id, gclient, db):
     import googleapiclient.errors
     if album_status == 'none':
         logging.info('Creating album "%s" (%s) (#%s)',
                      album.title, album.created.strftime('%Y-%m-%d'), album.id)
-    if album_status == 'none':
-        try:
-            resp = gclient.albums().create(body={'album': {'title': album.title}}).execute()
-            album_google_id = resp['id']
-        except googleapiclient.errors.HttpError as e:
-            if e.resp.status == http.HTTPStatus.TOO_MANY_REQUESTS:
-                raise GoogleAPILimitReached()
-            else:
-                raise e
-        db.execute("update gphotos_albums "
-                   "set status = ?, google_id = ? "
-                   "where album_id = ?", ('created', album_google_id, album.id))
-        db.commit()
+        retry = 0
+        while retry < 5:
+            try:
+                try:
+                    resp = gclient.albums().create(body={'album': {'title': album.title}}).execute()
+                    if 'id' not in resp:
+                        raise RetryException('unable to get album id')
+                    album_google_id = resp['id']
+                except googleapiclient.errors.HttpError as e:
+                    if e.resp.status == http.HTTPStatus.TOO_MANY_REQUESTS:
+                        raise GoogleAPILimitReached()
+                    else:
+                        raise RetryException('unable to add item to album: {}'.format(e))
+                db.execute("update gphotos_albums "
+                           "set status = ?, google_id = ? "
+                           "where album_id = ?", ('created', album_google_id, album.id))
+                db.commit()
+            except RetryException as e:
+                retry += 1
+                if retry < 5:
+                    logging.warning('Retrying creating album "%s" (#%s). Error: %s', album.title, album.id, e)
+                    time.sleep(15.0 * retry)
+                else:
+                    logging.error('Unable to create album "%s" (#%s), skipping. Last error was: %s',
+                                  album.title, album.id, e)
+
     return album_google_id
 
 
@@ -483,79 +501,105 @@ def upload_item_to_google_photos(archive, album_id, album_google_id, item_with_m
     item_status = item_row[0]
     item_google_id = item_row[1]
     if item_status == 'none':
-        meta_json = meta.data
-        file_size = archive.zip_files.file_size(item.file)
-        file_name = '{i.name}.{i.type}'.format(i=item)
-        logging.debug('Upload item #%s %s of %d bytes', item.id, file_name, file_size)
-        req = urllib.request.Request(
-            method='POST',
-            url='https://photoslibrary.googleapis.com/v1/uploads',
-            headers={
-                'Authorization': 'Bearer {}'.format(gcreds.token),
-                'Content-Length': '0',
-                'X-Goog-Upload-Command': 'start',
-                'X-Goog-Upload-Content-Type': 'application/octet-stream',
-                'X-Goog-Upload-File-Name': file_name,
-                'X-Goog-Upload-Protocol': 'resumable',
-                'X-Goog-Upload-Raw-Size': str(file_size),
-            }
-        )
-        status, headers, _ = http_request(req)
-        if status == http.HTTPStatus.OK:
-            fp = archive.zip_files.open_file(item.file)
-            upload_url = headers['X-Goog-Upload-URL']
-            chunk_size = int(headers['X-Goog-Upload-Chunk-Granularity'])
-            uploaded_bytes = 0
-            while True:
-                chunk_start = uploaded_bytes
-                uploaded_bytes += chunk_size
-                chunk_data = fp.read(chunk_size)
-                is_last_chunk = uploaded_bytes >= file_size
-                command = 'upload, finalize' if is_last_chunk else 'upload'
-                chunk_req = urllib.request.Request(
+        retry = 0
+        while retry < 5:
+            try:
+                meta_json = meta.data
+                file_size = archive.zip_files.file_size(item.file)
+                if file_size == 0:
+                    fp = archive.zip_files.open_file(item.file)
+                    file_size = len(fp.read())
+                    fp.close()
+                    if file_size == 0:
+                        logger.warning('Unable to get photo size neither from zip metadata '
+                                       'nor file content for item #%s',
+                                       item.id)
+                        raise RetryException('unable to get item size')
+                file_name = '{i.name}.{i.type}'.format(i=item)
+                logging.debug('Upload item #%s %s of %d bytes', item.id, file_name, file_size)
+                req = urllib.request.Request(
                     method='POST',
-                    url=upload_url,
+                    url='https://photoslibrary.googleapis.com/v1/uploads',
                     headers={
                         'Authorization': 'Bearer {}'.format(gcreds.token),
-                        'Content-Length': str(len(chunk_data)),
-                        'X-Goog-Upload-Command': command,
-                        'X-Goog-Upload-Offset': str(chunk_start),
-                    },
-                    data=chunk_data
+                        'Content-Length': '0',
+                        'X-Goog-Upload-Command': 'start',
+                        'X-Goog-Upload-Content-Type': 'application/octet-stream',
+                        'X-Goog-Upload-File-Name': file_name,
+                        'X-Goog-Upload-Protocol': 'resumable',
+                        'X-Goog-Upload-Raw-Size': str(file_size),
+                    }
                 )
-                status, headers, body = http_request(chunk_req)
-                logger.debug('upload chunk of %d bytes => %d', len(chunk_data), status)
-                if is_last_chunk:
-                    upload_token = body.decode('utf-8')
-                    break
-        body = {
-            'newMediaItems': [{
-                'description': meta_json.get('description') or file_name,
-                'simpleMediaItem': {
-                    'uploadToken': upload_token
+                status, headers, _ = http_request(req)
+                if status != http.HTTPStatus.OK:
+                    raise RetryException('unable to start item upload')
+                else:
+                    fp = archive.zip_files.open_file(item.file)
+                    upload_url = headers['X-Goog-Upload-URL']
+                    chunk_size = int(headers['X-Goog-Upload-Chunk-Granularity'])
+                    uploaded_bytes = 0
+                    while True:
+                        chunk_start = uploaded_bytes
+                        uploaded_bytes += chunk_size
+                        chunk_data = fp.read(chunk_size)
+                        is_last_chunk = uploaded_bytes >= file_size
+                        command = 'upload, finalize' if is_last_chunk else 'upload'
+                        chunk_req = urllib.request.Request(
+                            method='POST',
+                            url=upload_url,
+                            headers={
+                                'Authorization': 'Bearer {}'.format(gcreds.token),
+                                'Content-Length': str(len(chunk_data)),
+                                'X-Goog-Upload-Command': command,
+                                'X-Goog-Upload-Offset': str(chunk_start),
+                            },
+                            data=chunk_data
+                        )
+                        status, headers, body = http_request(chunk_req)
+                        logger.debug('upload chunk of %d bytes => %d', len(chunk_data), status)
+                        if status != http.HTTPStatus.OK:
+                            raise RetryException('unable to upload chunk')
+                        if is_last_chunk:
+                            upload_token = body.decode('utf-8')
+                            if len(upload_token) == 0:
+                                raise RetryException('unable to get uploaded item token')
+                            break
+                body = {
+                    'newMediaItems': [{
+                        'description': meta_json.get('description') or file_name,
+                        'simpleMediaItem': {
+                            'uploadToken': upload_token
+                        }
+                    }]
                 }
-            }]
-        }
-        if album_google_id is not None:
-            body['albumId'] = album_google_id
-        try:
-            response = gclient.mediaItems().batchCreate(body=body).execute()
-            item_google_id = response['newMediaItemResults'][0]['mediaItem']['id']
-        except googleapiclient.errors.HttpError as e:
-            if e.resp.status == http.HTTPStatus.TOO_MANY_REQUESTS:
-                raise GoogleAPILimitReached()
-            else:
-                raise e
+                if album_google_id is not None:
+                    body['albumId'] = album_google_id
+                try:
+                    response = gclient.mediaItems().batchCreate(body=body).execute()
+                    item_google_id = response['newMediaItemResults'][0]['mediaItem']['id']
+                except googleapiclient.errors.HttpError as e:
+                    if e.resp.status == http.HTTPStatus.TOO_MANY_REQUESTS:
+                        raise GoogleAPILimitReached()
+                    else:
+                        raise RetryException('unable to add item to album: {}'.format(e))
 
-        if album_id is not None:
-            db.execute("update gphotos_items "
-                       "set status = 'uploaded', google_id = ? "
-                       "where item_id = ? and album_id = ?", (item_google_id, item.id, album_id))
-        else:
-            db.execute("update gphotos_items "
-                       "set status = 'uploaded', google_id = ? "
-                       "where item_id = ? and album_id is null", (item_google_id, item.id))
-        db.commit()
+                if album_id is not None:
+                    db.execute("update gphotos_items "
+                               "set status = 'uploaded', google_id = ? "
+                               "where item_id = ? and album_id = ?", (item_google_id, item.id, album_id))
+                else:
+                    db.execute("update gphotos_items "
+                               "set status = 'uploaded', google_id = ? "
+                               "where item_id = ? and album_id is null", (item_google_id, item.id))
+                db.commit()
+            except RetryException as e:
+                retry += 1
+                if retry < 5:
+                    logging.warning('Retrying uploading item %s (#%s). Error: %s', item.name, item.id, e)
+                    time.sleep(15.0 * retry)
+                else:
+                    logging.error('Unable to upload item %s (#%s), skipping. Last error was: %s',
+                                  item.name, item.id, e)
 
     return item_google_id
 
@@ -664,20 +708,28 @@ def upload_to_google_photos(archive_globs, db_path):
         logger.info('Items to upload added: %d', items_created)
 
     albums = db.execute('select album_id, status, google_id from gphotos_albums order by seq_id').fetchall()
+    skipped_items = 0
+    skipped_albums = 0
     for album_row in albums:
         album_id = album_row[0]
         album = archive.albums[album_id]
+        total_items = len(album.items_ids)
 
         album_google_id = create_google_photos_album(album, album_status=album_row[1], album_google_id=album_row[2],
                                                      gclient=gclient, db=db)
 
-        total_items = len(album.items_ids)
+        if album_google_id is None:
+            skipped_albums += 1
+            skipped_items += total_items
+            continue
+
         logging.info('Uploading %d items for album "%s" (%s)',
                      total_items, album.title, album.created.strftime('%Y-%m-%d'))
 
         for index, item_id in enumerate(album.items_ids):
             item = archive.matched[item_id]
-            upload_item_to_google_photos(archive, album_id, album_google_id, item, gclient, gcreds, db)
+            if upload_item_to_google_photos(archive, album_id, album_google_id, item, gclient, gcreds, db) is None:
+                skipped_items += 1
             if index != 0 and index % 10 == 0:
                 logging.info('.. %d / %d', index, total_items)
         logging.info('.. %d / %d - Done', total_items, total_items)
@@ -687,9 +739,15 @@ def upload_to_google_photos(archive_globs, db_path):
 
     for index, item_id in enumerate(archive.items_without_albums):
         item = archive.matched[item_id]
-        upload_item_to_google_photos(archive, None, None, item, gclient, gcreds, db)
+        if upload_item_to_google_photos(archive, None, None, item, gclient, gcreds, db) is None:
+            skipped_items += 1
         if index != 0 and index % 10 == 0:
             logging.info('.. %d / %d', index, total_items)
+
+    if skipped_albums > 0:
+        logging.error('⚠️ Unable to upload %d albums, try running script again')
+    if skipped_items > 0:
+        logging.error('⚠️ Unable to upload %d items, try running script again')
     logging.info('.. %d / %d - Done', total_items, total_items)
     db.commit()
 
