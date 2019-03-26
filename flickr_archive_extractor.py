@@ -13,6 +13,7 @@ import random
 import datetime
 import pickle
 import urllib.request
+import urllib.error
 import http
 import time
 
@@ -453,6 +454,8 @@ def create_google_photos_album(album, album_status, album_google_id, gclient, db
                      album.title, album.created.strftime('%Y-%m-%d'), album.id)
         retry = 0
         while retry < 5:
+            if retry > 0:
+                time.sleep(15.0 * retry)
             try:
                 try:
                     resp = gclient.albums().create(body={'album': {'title': album.title}}).execute()
@@ -472,7 +475,6 @@ def create_google_photos_album(album, album_status, album_google_id, gclient, db
                 retry += 1
                 if retry < 5:
                     logging.warning('Retrying creating album "%s" (#%s). Error: %s', album.title, album.id, e)
-                    time.sleep(15.0 * retry)
                 else:
                     logging.error('Unable to create album "%s" (#%s), skipping. Last error was: %s',
                                   album.title, album.id, e)
@@ -486,6 +488,8 @@ def http_request(req: urllib.request.Request):
         return response.status, dict(response.getheaders()), response.read()
     except urllib.request.HTTPError as e:
         return e.code, dict(e.headers), e.read()
+    except urllib.error.URLError:
+        return 599, dict(), b''
 
 
 def upload_item_to_google_photos(archive, album_id, album_google_id, item_with_meta, gclient, gcreds, db):
