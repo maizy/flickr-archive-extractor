@@ -16,6 +16,7 @@ import urllib.request
 import urllib.error
 import http
 import time
+import socket
 
 __version__ = '0.0.3'
 
@@ -444,7 +445,10 @@ def init_items_to_upload_to_google_photos(items_with_metadata, item_to_albums_in
 
 
 class RetryException(Exception):
-    pass
+
+    def __init__(self, message, sleep_time=15.0):
+        self.sleep_time = sleep_time
+        super(RetryException, self).__init__(message)
 
 
 def create_google_photos_album(album, album_status, album_google_id, gclient, db):
@@ -453,9 +457,10 @@ def create_google_photos_album(album, album_status, album_google_id, gclient, db
         logging.info('Creating album "%s" (%s) (#%s)',
                      album.title, album.created.strftime('%Y-%m-%d'), album.id)
         retry = 0
+        sleep_time = 15.0
         while retry < 5:
             if retry > 0:
-                time.sleep(15.0 * retry)
+                time.sleep(sleep_time)
             try:
                 try:
                     resp = gclient.albums().create(body={'album': {'title': album.title}}).execute()
@@ -473,6 +478,7 @@ def create_google_photos_album(album, album_status, album_google_id, gclient, db
                 db.commit()
             except RetryException as e:
                 retry += 1
+                sleep_time = e.sleep_time * retry
                 if retry < 5:
                     logging.warning('Retrying creating album "%s" (#%s). Error: %s', album.title, album.id, e)
                 else:
@@ -482,13 +488,15 @@ def create_google_photos_album(album, album_status, album_google_id, gclient, db
     return album_google_id
 
 
-def http_request(req: urllib.request.Request):
+def http_request(req: urllib.request.Request, timeout=15.0):
     try:
-        response = urllib.request.urlopen(req)
+        response = urllib.request.urlopen(req, timeout=timeout)
         return response.status, dict(response.getheaders()), response.read()
     except urllib.request.HTTPError as e:
         return e.code, dict(e.headers), e.read()
     except urllib.error.URLError:
+        return 599, dict(), b''
+    except socket.timeout:
         return 599, dict(), b''
 
 
@@ -506,7 +514,10 @@ def upload_item_to_google_photos(archive, album_id, album_google_id, item_with_m
     item_google_id = item_row[1]
     if item_status == 'none':
         retry = 0
+        sleep_time = 15.0
         while retry < 5:
+            if retry > 0:
+                time.sleep(sleep_time)
             try:
                 meta_json = meta.data
                 file_size = archive.zip_files.file_size(item.file)
@@ -518,7 +529,7 @@ def upload_item_to_google_photos(archive, album_id, album_google_id, item_with_m
                         logger.warning('Unable to get photo size neither from zip metadata '
                                        'nor file content for item #%s',
                                        item.id)
-                        raise RetryException('unable to get item size')
+                        raise RetryException('unable to get item size', sleep_time=0.5)
                 file_name = '{i.name}.{i.type}'.format(i=item)
                 logging.debug('Upload item #%s %s of %d bytes', item.id, file_name, file_size)
                 req = urllib.request.Request(
@@ -559,7 +570,7 @@ def upload_item_to_google_photos(archive, album_id, album_google_id, item_with_m
                             },
                             data=chunk_data
                         )
-                        status, headers, body = http_request(chunk_req)
+                        status, headers, body = http_request(chunk_req, timeout=60.0)
                         logger.debug('upload chunk of %d bytes => %d', len(chunk_data), status)
                         if status != http.HTTPStatus.OK:
                             raise RetryException('unable to upload chunk')
@@ -598,9 +609,9 @@ def upload_item_to_google_photos(archive, album_id, album_google_id, item_with_m
                 db.commit()
             except RetryException as e:
                 retry += 1
+                sleep_time = e.sleep_time * retry
                 if retry < 5:
                     logging.warning('Retrying uploading item %s (#%s). Error: %s', item.name, item.id, e)
-                    time.sleep(15.0 * retry)
                 else:
                     logging.error('Unable to upload item %s (#%s), skipping. Last error was: %s',
                                   item.name, item.id, e)
