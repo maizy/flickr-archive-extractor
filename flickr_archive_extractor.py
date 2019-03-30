@@ -226,16 +226,16 @@ class FlickrArchive:
                 if item_metadata_match:
                     item_metadata = cls._process_item_metadata(file, zip_files, item_metadata_match)
                     if item_metadata.id in items_metadata:
-                        logging.warning('Duplicate item info with id %s. %s, %s',
-                                        item_metadata.id, items_metadata[item_metadata.id], item_metadata)
+                        logger.warning('Duplicate item info with id %s. %s, %s',
+                                       item_metadata.id, items_metadata[item_metadata.id], item_metadata)
                     else:
                         items_metadata[item_metadata.id] = item_metadata
                     continue
 
                 if not IGNORED_JSONS_RE.match(file_path):
-                    logging.warning('Unknown file in archive: %s', file)
+                    logger.warning('Unknown file in archive: %s', file)
 
-        logging.debug('Item types in archive: {}'.format(', '.join(types)))
+        logger.debug('Item types in archive: {}'.format(', '.join(types)))
         return FlickrArchive(zip_files, albums_file, items_metadata, items)
 
     @classmethod
@@ -385,7 +385,7 @@ def init_google_photos_api(credentials_path, db):
     except ImportError:
         logger.critical('extra requirements needed for working with google photo.\n'
                         '  python3 -m pip install -r requirements-google-photo.txt')
-        return None
+        return None, None
 
     creds = None
     token_res = db.execute('select token from gphotos_token').fetchone()
@@ -446,16 +446,17 @@ def init_items_to_upload_to_google_photos(items_with_metadata, item_to_albums_in
 
 class RetryException(Exception):
 
-    def __init__(self, message, sleep_time=15.0):
+    def __init__(self, message, sleep_time=15.0, force_size_recalculate=None):
         self.sleep_time = sleep_time
+        self.force_size_recalculate = force_size_recalculate
         super(RetryException, self).__init__(message)
 
 
 def create_google_photos_album(album, album_status, album_google_id, gclient, db):
     import googleapiclient.errors
     if album_status == 'none':
-        logging.info('Creating album "%s" (%s) (#%s)',
-                     album.title, album.created.strftime('%Y-%m-%d'), album.id)
+        logger.info('Creating album "%s" (%s) (#%s)',
+                    album.title, album.created.strftime('%Y-%m-%d'), album.id)
         retry = 0
         sleep_time = 15.0
         while retry < 5:
@@ -476,14 +477,15 @@ def create_google_photos_album(album, album_status, album_google_id, gclient, db
                            "set status = ?, google_id = ? "
                            "where album_id = ?", ('created', album_google_id, album.id))
                 db.commit()
+                break
             except RetryException as e:
                 retry += 1
                 sleep_time = e.sleep_time * retry
                 if retry < 5:
-                    logging.warning('Retrying creating album "%s" (#%s). Error: %s', album.title, album.id, e)
+                    logger.warning('Retrying creating album "%s" (#%s). Error: %s', album.title, album.id, e)
                 else:
-                    logging.error('Unable to create album "%s" (#%s), skipping. Last error was: %s',
-                                  album.title, album.id, e)
+                    logger.error('Unable to create album "%s" (#%s), skipping. Last error was: %s',
+                                 album.title, album.id, e)
 
     return album_google_id
 
@@ -515,15 +517,18 @@ def upload_item_to_google_photos(archive, album_id, album_google_id, item_with_m
     if item_status == 'none':
         retry = 0
         sleep_time = 15.0
+        recalculate_size = False
+        preloaded_body = None
         while retry < 5:
             if retry > 0:
                 time.sleep(sleep_time)
             try:
                 meta_json = meta.data
                 file_size = archive.zip_files.file_size(item.file)
-                if file_size == 0:
+                if file_size == 0 or recalculate_size:
                     fp = archive.zip_files.open_file(item.file)
-                    file_size = len(fp.read())
+                    preloaded_body = fp.read()
+                    file_size = len(preloaded_body)
                     fp.close()
                     if file_size == 0:
                         logger.warning('Unable to get photo size neither from zip metadata '
@@ -531,7 +536,7 @@ def upload_item_to_google_photos(archive, album_id, album_google_id, item_with_m
                                        item.id)
                         raise RetryException('unable to get item size', sleep_time=0.5)
                 file_name = '{i.name}.{i.type}'.format(i=item)
-                logging.debug('Upload item #%s %s of %d bytes', item.id, file_name, file_size)
+                logger.debug('Upload item #%s %s of %d bytes', item.id, file_name, file_size)
                 req = urllib.request.Request(
                     method='POST',
                     url='https://photoslibrary.googleapis.com/v1/uploads',
@@ -555,8 +560,15 @@ def upload_item_to_google_photos(archive, album_id, album_google_id, item_with_m
                     uploaded_bytes = 0
                     while True:
                         chunk_start = uploaded_bytes
-                        uploaded_bytes += chunk_size
-                        chunk_data = fp.read(chunk_size)
+                        if preloaded_body is not None:
+                            chunk_data = preloaded_body[chunk_start:chunk_start+chunk_size]
+                        else:
+                            chunk_data = fp.read(chunk_size)
+                        if len(chunk_data) > chunk_size or chunk_data == b'':
+                            logger.debug('Wrong chunk size on upload #%s %s, expected chunk_size: %d, read size: %d',
+                                         item.id, file_name, chunk_size, len(chunk_data))
+                            raise RetryException('Wrong archive file size', force_size_recalculate=True)
+                        uploaded_bytes += len(chunk_data)
                         is_last_chunk = uploaded_bytes >= file_size
                         command = 'upload, finalize' if is_last_chunk else 'upload'
                         chunk_req = urllib.request.Request(
@@ -607,15 +619,17 @@ def upload_item_to_google_photos(archive, album_id, album_google_id, item_with_m
                                "set status = 'uploaded', google_id = ? "
                                "where item_id = ? and album_id is null", (item_google_id, item.id))
                 db.commit()
+                break
             except RetryException as e:
                 retry += 1
                 sleep_time = e.sleep_time * retry
+                if e.force_size_recalculate is not None:
+                    recalculate_size = e.force_size_recalculate
                 if retry < 5:
-                    logging.warning('Retrying uploading item %s (#%s). Error: %s', item.name, item.id, e)
+                    logger.warning('Retrying uploading item %s (#%s). Error: %s', item.name, item.id, e)
                 else:
-                    logging.error('Unable to upload item %s (#%s), skipping. Last error was: %s',
-                                  item.name, item.id, e)
-
+                    logger.error('Unable to upload item %s (#%s), skipping. Last error was: %s',
+                                 item.name, item.id, e)
     return item_google_id
 
 
@@ -738,35 +752,35 @@ def upload_to_google_photos(archive_globs, db_path):
             skipped_items += total_items
             continue
 
-        logging.info('Uploading %d items for album "%s" (%s)',
-                     total_items, album.title, album.created.strftime('%Y-%m-%d'))
+        logger.info('Uploading %d items for album "%s" (%s)',
+                    total_items, album.title, album.created.strftime('%Y-%m-%d'))
 
         for index, item_id in enumerate(album.items_ids):
             item = archive.matched[item_id]
             if upload_item_to_google_photos(archive, album_id, album_google_id, item, gclient, gcreds, db) is None:
                 skipped_items += 1
             if index != 0 and index % 10 == 0:
-                logging.info('.. %d / %d', index, total_items)
-        logging.info('.. %d / %d - Done', total_items, total_items)
+                logger.info('.. %d / %d', index, total_items)
+        logger.info('.. %d / %d - Done', total_items, total_items)
 
     total_items = len(archive.items_without_albums)
-    logging.info('Uploading %d items without albums', total_items)
+    logger.info('Uploading %d items without albums', total_items)
 
     for index, item_id in enumerate(archive.items_without_albums):
         item = archive.matched[item_id]
         if upload_item_to_google_photos(archive, None, None, item, gclient, gcreds, db) is None:
             skipped_items += 1
         if index != 0 and index % 10 == 0:
-            logging.info('.. %d / %d', index, total_items)
+            logger.info('.. %d / %d', index, total_items)
 
     if skipped_albums > 0:
-        logging.error('⚠️ Unable to upload %d albums, try running script again')
+        logger.error('⚠️ Unable to upload %d albums, try running script again')
     if skipped_items > 0:
-        logging.error('⚠️ Unable to upload %d items, try running script again')
-    logging.info('.. %d / %d - Done', total_items, total_items)
+        logger.error('⚠️ Unable to upload %d items, try running script again')
+    logger.info('.. %d / %d - Done', total_items, total_items)
     db.commit()
 
-    logging.info('🎉 Job is done')
+    logger.info('🎉 Job is done')
     db.close()
     return 0
 
