@@ -18,7 +18,7 @@ import http
 import time
 import socket
 
-__version__ = '0.0.3'
+__version__ = '0.1.0'
 
 logger = logging.getLogger('flickr_archive_extractor')
 
