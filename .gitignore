@@ -46,3 +46,6 @@ Desktop.ini
 
 #virtualenv
 venv/
+
+# keys
+client_id.json
