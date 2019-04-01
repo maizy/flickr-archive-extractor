@@ -2,7 +2,7 @@ from setuptools import setup
 
 setup(
     name='flickr-archive-extractor',
-    version='0.1.0',
+    version='0.1.1',
     install_requires=[],
     tests_require=['nose>=1.3', 'pycodestyle'],
     test_suite='nose.collector',
