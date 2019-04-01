@@ -604,6 +604,8 @@ def upload_item_to_google_photos(archive, album_id, album_google_id, item_with_m
                 try:
                     response = gclient.mediaItems().batchCreate(body=body).execute()
                     item_google_id = response['newMediaItemResults'][0]['mediaItem']['id']
+                except KeyError:
+                    raise RetryException('unable to add item to album: wrong Google API response')
                 except googleapiclient.errors.HttpError as e:
                     if e.resp.status == http.HTTPStatus.TOO_MANY_REQUESTS:
                         raise GoogleAPILimitReached()
@@ -773,12 +775,13 @@ def upload_to_google_photos(archive_globs, db_path):
         if index != 0 and index % 10 == 0:
             logger.info('.. %d / %d', index, total_items)
 
-    if skipped_albums > 0:
-        logger.error('⚠️ Unable to upload %d albums, try running script again')
-    if skipped_items > 0:
-        logger.error('⚠️ Unable to upload %d items, try running script again')
     logger.info('.. %d / %d - Done', total_items, total_items)
     db.commit()
+
+    if skipped_albums > 0:
+        logger.error('⚠️ Unable to upload %d albums, try running script again', skipped_albums)
+    if skipped_items > 0:
+        logger.error('⚠️ Unable to upload %d items, try running script again', skipped_items)
 
     logger.info('🎉 Job is done')
     db.close()
